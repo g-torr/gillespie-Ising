@@ -1,0 +1,199 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+#include <curand_kernel.h>
+#define imin(a,b) (a<b?a:b)
+const int DIM=128;
+const int threadsperblock=32;
+const int durata=10000;
+const int save_every=1000;// it should be a divisor of durata
+#define J 1.f
+//const float T=.1f;
+/*
+texture <float,2> text_Told;
+texture <float,2> text_Tnew;
+texture <float,2> text_Tfix;*/
+
+void	stampa(float*S, int n){int i,j;for(i=0;i<n;i++){for(j=0;j<n;j++){printf("%f	",S[i+(j*n)]);}
+							printf("\n");}}
+	
+
+void	stampa_file(float ** storage){FILE*f; f=fopen("output.txt","w");int i,n,j;
+for(n=0;n<(durata/save_every)+1;n++){
+fprintf(f," copio la matrice %d\n",n);
+					for(i=0;i<DIM;i++){for(j=0;j<DIM;j++){fprintf(f,"%f	",storage[n][i+(j*DIM)]);}
+							fprintf(f,"\n");}}
+fclose(f);}
+
+struct dati{
+		float* old;
+		float* upd;
+		};
+
+__global__ void setup_random_kernel(curandState* stato){
+			int x,y,offset;
+			 x=threadIdx.x+blockIdx.x*blockDim.x;
+			 y=threadIdx.y+blockIdx.y*blockDim.y;
+			 offset= x+y*DIM;
+			curand_init(1234,offset,0,&stato[offset]); //inizializzo lo stato che mi genera i numeri casuali curand_init (seed,sequence,offset, curandState_t *state). per evitare ogni tipo di problemi qui si è scelto lo stesso seme per tutti i thread, ogni thread avrà sequenza differente: ovvero partendo dallo stesso seme si scartano i primi offset*2^67 numeri casuali) a meno che il successivo  codice che si utilizza richiede 2^67 numeri casuali, noi siamo tranquilli che non ci siano overlap di numeri casuali. Si potrebbe cambiare il seme per ogni indice, fissare la sequenza a 0: si  potrebbero avere problemi di correlazione tra le sequenze di numeri con semi diversi(cosa molto rara). Dato che effettivamente l'idea di sprecare 2*67 numeri casuali  per ogni thread mi sembra una follia, forse la soluzione più semplice potrebbe essere quella di giocare sull'offset, in effetti se si fissano seme e sequence, mentre si  fissa il parametro offset= k*id, con k un qualsiasi numero > #numeri casuali che uso in ogni  tread  dovrei essere tranquillo che non si abbiano sovrapposizioni
+			}
+
+
+
+
+
+
+
+
+__global__  void   inizializza(float *S,curandState* gen_random)	{ int x,y,offset;
+							x=threadIdx.x+blockIdx.x*blockDim.x;
+							y=threadIdx.y+blockIdx.y*blockDim.y;
+							offset=x+y*DIM;
+                                float p=curand_uniform(&gen_random[offset]);
+                             	if(p>0.5)	S[offset]=-1;
+                                else 		S[offset]=1;}
+                               		    	 
+
+
+__global__ void execute(float* old, float* upd,curandState* gen_random){int x,y,offset;
+							float T=0.1f;
+							int id_x=threadIdx.x+blockIdx.x*blockDim.x;
+							int id_y=threadIdx.y+blockIdx.y*blockDim.y;
+							int i;
+							for (i=0;i<2;i++){
+								x=2*id_x+i;
+								y=2*id_y+i;
+								offset=x+y*DIM;
+								int u,b,l,r;//interazione a primi vicini:up,bottom,left,right
+								//periodic boundary condition
+								if(x==0) 	{u=offset+(DIM-1);b=offset+1;}
+								else if(x==DIM-1){b=offset-(DIM-1);u=offset-1;}
+								else		{u=offset-1;b=offset+1;}
+								if (y==0)	{l=offset+(DIM-1)*DIM;r=offset+DIM;}
+								else if(y==DIM-1){r=offset-(DIM-1)*DIM;l=offset-DIM;}
+								else		{r=offset+DIM;l=offset-DIM;}
+								float s=old[offset];//previous spin
+								float delta_E=2*J*s*(old[u]+old[b]+old[l]+old[r]);
+								if (delta_E<0)	{upd[offset]=-s;}
+								else		{
+										if (curand_uniform(&gen_random[offset])<exp(-delta_E/T))
+												upd[offset]=-s;
+										else	upd[offset]=s;
+										}
+											}
+
+}
+
+__global__ void execute2(float* old, float* upd,curandState* gen_random){int x,y,offset;
+							float T=0.3f;
+							int id_x=threadIdx.x+blockIdx.x*blockDim.x;
+							int id_y=threadIdx.y+blockIdx.y*blockDim.y;
+							int i;
+							float s,delta_E;
+							for (i=0;i<2;i++){
+								x=2*id_x+i;
+								y=2*id_y+(i+1)%2;
+								offset=x+y*DIM;
+								int u,b,l,r;//interazione a primi vicini:up,bottom,left,right
+								//periodic boundary condition
+								if(x==0) 	{u=offset+(DIM-1);b=offset+1;}
+								else if(x==DIM-1){b=offset-(DIM-1);u=offset-1;}
+								else		{u=offset-1;b=offset+1;}
+								if (y==0)	{l=offset+(DIM-1)*DIM;r=offset+DIM;}
+								else if(y==DIM-1){r=offset-(DIM-1)*DIM;l=offset-DIM;}
+								else		{r=offset+DIM;l=offset-DIM;}
+								s=old[offset];//previous spin
+								delta_E=2*J*s*(old[u]+old[b]+old[l]+old[r]);
+								if (delta_E<0)	{upd[offset]=-s;}
+								else		{
+										if (curand_uniform(&gen_random[offset])<exp(-delta_E/T))
+												upd[offset]=-s;
+										else	upd[offset]=s;
+										}
+								}
+
+}
+
+void	time_step(dati* S,curandState* gen_random)	{
+				// A naive implementation, simulating all the spin in once, suffered from deep instabilities. It basically kept oscillating between two states. To solve this issue I should not simulate all the spins in once, but all the white and then the black in a chessboard. To do so,  I lanch half of the x and y  threads
+				dim3 blocks(DIM/threadsperblock,DIM/threadsperblock);
+				dim3 threads (threadsperblock/2,threadsperblock/2);
+				execute<<<blocks,threads>>>(S->old,S->upd,gen_random); //here mappings (x,y)->(2x,2y) and (x,y)->(2x+1,2y+1)
+				execute2<<<blocks,threads>>>(S->old,S->upd,gen_random);//here mappings (x,y)->(2x+1,2y) and (x,y)->(2x,2y+1)
+				S->old=S->upd;				
+			}
+				
+
+
+
+
+main(){srand(5);
+cudaEvent_t start,stop;
+cudaEventCreate(&start);
+cudaEventCreate(&stop);
+cudaEventRecord(start,0);
+dim3 blocks(DIM/threadsperblock,DIM/threadsperblock); // it is a two dimensional grid, so we need a tuple for the x,y  dimensions
+dim3 threads (threadsperblock,threadsperblock);
+//printf("WARNING!!! \n UPDATE it does NOT work\n");
+
+curandState * generatori_random;//alloco il generatore dei numeri random sul device
+if (durata> pow(2,67)) printf("ATTENZIONE! ricontrollare il generatore di numeri casuali"); 
+cudaMalloc((void**)&generatori_random,DIM*DIM*sizeof(curandState));
+setup_random_kernel<<<blocks,threads>>>(generatori_random);
+
+
+dati S_dev;
+//S_dev=(dati*)malloc(durata*sizeof(dati));
+
+
+int n=0;			//definisco matrici nella GPU
+
+cudaMalloc((void**)&S_dev.old,DIM*DIM*sizeof(float));//}
+	
+inizializza<<<blocks,threads>>>(S_dev.old,generatori_random);
+
+
+
+cudaMalloc((void**)&S_dev.upd,DIM*DIM*sizeof(float));
+ 
+float ** storage;
+storage=(float**)malloc(((durata/save_every)+1)*sizeof(float*));
+storage[0]=(float*)malloc(DIM*DIM*sizeof(float));
+cudaMemcpy(storage[0],S_dev.old,DIM*DIM*sizeof(float),cudaMemcpyDeviceToHost);
+int count=1;
+
+//Main part
+for(n=1;n<durata;n++){
+	time_step(&S_dev,generatori_random);
+	if (n%save_every==0){
+		printf("step %d / %d \n",count,durata/save_every);
+		storage[count]=(float*)malloc(DIM*DIM*sizeof(float));
+		cudaMemcpy(storage[count],S_dev.upd,DIM*DIM*sizeof(float),cudaMemcpyDeviceToHost);
+		count++;}	
+	}
+storage[count]=(float*)malloc(DIM*DIM*sizeof(float));
+cudaMemcpy(storage[count],S_dev.upd,DIM*DIM*sizeof(float),cudaMemcpyDeviceToHost);
+
+
+
+//end titles
+cudaEventRecord(stop,0);
+cudaEventSynchronize(stop);
+float tempo_trascorso; cudaEventElapsedTime(&tempo_trascorso,start,stop);
+stampa_file(storage);
+printf("il tempo necessario per eseguire il programma è %f ms\n",tempo_trascorso);
+
+
+/*				serviva a controllaregli indici della griglia
+int indici[DIM*DIM];int j,offset;printf("stampo gli indici \n");
+for(i=0;i<DIM;i++){for(j=0;j<DIM;j++){offset=i+(j*DIM); printf("%d	",offset);}
+		printf("\n");}
+*/
+cudaFree(S_dev.upd);
+cudaFree(S_dev.old);
+
+
+
+return 0;
+}
